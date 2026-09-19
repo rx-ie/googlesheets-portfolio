@@ -1,0 +1,572 @@
+const PORTFOLIO_CONFIG = {
+  SHEET_NAME: 'Dashboard',
+  RECIPIENT_EMAIL: '[YOUR_EMAIL_HERE]',
+  GEMINI_MODEL: 'gemini-3.5-flash-lite',
+  TIMEZONE: 'Asia/Singapore',
+  SEND_HOUR_FRIDAY_SGT: 18,
+  TAVILY_MAX_RESULTS: 5,
+  TAVILY_SEARCH_DEPTH: 'basic',
+  SNAPSHOT_PROPERTY_KEY: 'PORTFOLIO_LAST_SNAPSHOT'
+};
+
+const TAVILY_GROUPS = [
+  {
+    groupName: 'Singapore Blue Chips & REITs',
+    query: '("Asset A" OR "Asset B" OR "Asset C" OR "Asset D") latest news OR earnings OR business update OR refinancing OR rates OR guidance past week Singapore SGX'
+  },
+  {
+    groupName: 'Asian & China Market ETFs',
+    query: '("ETF X" OR "ETF Y" OR "ETF Z" OR "ETF W") latest news OR China market OR Asia equities OR macro developments past week'
+  },
+  {
+    groupName: 'Broad Market & Fixed Income ETFs',
+    query: '("ETF P" OR "ETF Q" OR "ETF R") latest news OR market outlook OR index performance OR rates OR bond yields past week'
+  }
+];
+
+function setPortfolioApiKeys() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('GEMINI_API_KEY', '[PASTE_GEMINI_KEY_HERE]');
+  props.setProperty('TAVILY_API_KEY', '[PASTE_TAVILY_KEY_HERE]');
+}
+
+function createWeeklyPortfolioTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => {
+    if (trigger.getHandlerFunction() === 'sendWeeklyPortfolioEmail') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ScriptApp.newTrigger('sendWeeklyPortfolioEmail')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.FRIDAY)
+    .atHour(PORTFOLIO_CONFIG.SEND_HOUR_FRIDAY_SGT)
+    .everyWeeks(1)
+    .create();
+}
+
+function sendWeeklyPortfolioEmail() {
+  if (!isFridayAfterClose_()) return;
+
+  const currentHoldings = getDashboardHoldings();
+  if (!currentHoldings.length) {
+    throw new Error('No valid holdings found in Dashboard sheet.');
+  }
+
+  const previousSnapshot = getPreviousSnapshot_();
+  const changeSummary = buildPortfolioChangeSummary_(currentHoldings, previousSnapshot);
+  const groupedResearch = getGroupedTavilyResearch();
+  const prompt = buildGeminiPortfolioPrompt(currentHoldings, previousSnapshot, changeSummary, groupedResearch);
+
+  let htmlReport;
+  try {
+    htmlReport = callGeminiForHtmlReport(prompt);
+  } catch (e) {
+    htmlReport = buildFallbackHtmlReport(changeSummary, groupedResearch, e);
+  }
+
+  const dateLabel = Utilities.formatDate(new Date(), PORTFOLIO_CONFIG.TIMEZONE, 'yyyy-MM-dd');
+
+  GmailApp.sendEmail(
+    PORTFOLIO_CONFIG.RECIPIENT_EMAIL,
+    `Weekly Portfolio Update - ${dateLabel}`,
+    'HTML email required.',
+    {
+      htmlBody: htmlReport,
+      name: 'Portfolio Report Bot'
+    }
+  );
+
+  saveCurrentSnapshot_(currentHoldings);
+}
+
+function previewWeeklyPortfolioReport() {
+  const currentHoldings = getDashboardHoldings();
+  if (!currentHoldings.length) {
+    throw new Error('No valid holdings found in Dashboard sheet.');
+  }
+
+  const previousSnapshot = getPreviousSnapshot_();
+  const changeSummary = buildPortfolioChangeSummary_(currentHoldings, previousSnapshot);
+  const groupedResearch = getGroupedTavilyResearch();
+  const prompt = buildGeminiPortfolioPrompt(currentHoldings, previousSnapshot, changeSummary, groupedResearch);
+
+  let htmlReport;
+  try {
+    htmlReport = callGeminiForHtmlReport(prompt);
+  } catch (e) {
+    htmlReport = buildFallbackHtmlReport(changeSummary, groupedResearch, e);
+  }
+
+  GmailApp.sendEmail(
+    PORTFOLIO_CONFIG.RECIPIENT_EMAIL,
+    'Preview - Weekly Portfolio Update',
+    'HTML email required.',
+    {
+      htmlBody: htmlReport,
+      name: 'Portfolio Report Bot'
+    }
+  );
+}
+
+function isFridayAfterClose_() {
+  const now = new Date();
+  const day = Utilities.formatDate(now, PORTFOLIO_CONFIG.TIMEZONE, 'E');
+  const hour = Number(Utilities.formatDate(now, PORTFOLIO_CONFIG.TIMEZONE, 'H'));
+  return day === 'Fri' && hour >= PORTFOLIO_CONFIG.SEND_HOUR_FRIDAY_SGT;
+}
+
+function getDashboardHoldings() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(PORTFOLIO_CONFIG.SHEET_NAME);
+  if (!sheet) {
+    throw new Error(`Sheet "${PORTFOLIO_CONFIG.SHEET_NAME}" not found.`);
+  }
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  const headers = values[0].map(h => String(h).trim());
+  const rows = values.slice(1);
+
+  const headerMap = {};
+  headers.forEach((header, index) => {
+    headerMap[header] = index;
+  });
+
+  const requiredHeaders = [
+    'Ticker',
+    'Asset Name',
+    'P / L %',
+    'Current Price',
+    'NAV',
+    'Quantity (Units)',
+    'Avg Cost / W.A.C.',
+    'Total Capital Invested',
+    'Current Value',
+    'P/ L',
+    'Type'
+  ];
+
+  requiredHeaders.forEach(header => {
+    if (!(header in headerMap)) {
+      throw new Error(`Missing required header: "${header}"`);
+    }
+  });
+
+  return rows
+    .map(row => ({
+      ticker: String(row[headerMap['Ticker']] || '').trim(),
+      assetName: String(row[headerMap['Asset Name']] || '').trim(),
+      profitLossPct: toNumber(row[headerMap['P / L %']]),
+      currentPrice: toNumber(row[headerMap['Current Price']]),
+      nav: toNumber(row[headerMap['NAV']]),
+      quantity: toNumber(row[headerMap['Quantity (Units)']]),
+      avgCost: toNumber(row[headerMap['Avg Cost / W.A.C.']]),
+      totalInvested: toNumber(row[headerMap['Total Capital Invested']]),
+      currentValue: toNumber(row[headerMap['Current Value']]),
+      profitLoss: toNumber(row[headerMap['P/ L']]),
+      type: String(row[headerMap['Type']] || '').trim()
+    }))
+    .filter(h => h.ticker && h.assetName && (h.quantity > 0 || h.currentValue > 0 || h.totalInvested > 0));
+}
+
+function getPreviousSnapshot_() {
+  const raw = PropertiesService.getScriptProperties().getProperty(PORTFOLIO_CONFIG.SNAPSHOT_PROPERTY_KEY);
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveCurrentSnapshot_(holdings) {
+  const snapshot = {
+    savedAt: new Date().toISOString(),
+    holdings: holdings
+  };
+
+  PropertiesService.getScriptProperties().setProperty(
+    PORTFOLIO_CONFIG.SNAPSHOT_PROPERTY_KEY,
+    JSON.stringify(snapshot)
+  );
+}
+
+function buildPortfolioChangeSummary_(currentHoldings, previousSnapshot) {
+  const previousHoldings = previousSnapshot && previousSnapshot.holdings ? previousSnapshot.holdings : [];
+  const previousMap = {};
+  previousHoldings.forEach(h => {
+    previousMap[h.ticker] = h;
+  });
+
+  const currentMap = {};
+  currentHoldings.forEach(h => {
+    currentMap[h.ticker] = h;
+  });
+
+  const totalCurrentValue = currentHoldings.reduce((sum, h) => sum + Number(h.currentValue || 0), 0);
+
+  const holdingChanges = currentHoldings.map(current => {
+    const previous = previousMap[current.ticker];
+    const previousPrice = previous ? Number(previous.currentPrice || 0) : 0;
+    const currentPrice = Number(current.currentPrice || 0);
+    const priceChange = previous ? (currentPrice - previousPrice) : currentPrice;
+    const priceChangePct = previousPrice ? (priceChange / previousPrice) * 100 : null;
+
+    return {
+      ticker: current.ticker,
+      assetName: current.assetName,
+      type: current.type,
+      previousPrice,
+      currentPrice,
+      priceChange,
+      priceChangePct,
+      previousQuantity: previous ? Number(previous.quantity || 0) : 0,
+      currentQuantity: Number(current.quantity || 0),
+      quantityChange: previous ? Number(current.quantity || 0) - Number(previous.quantity || 0) : Number(current.quantity || 0),
+      currentValue: Number(current.currentValue || 0),
+      allocationPct: totalCurrentValue ? (Number(current.currentValue || 0) / totalCurrentValue) * 100 : 0,
+      isNew: !previous
+    };
+  });
+
+  const removedHoldings = previousHoldings
+    .filter(prev => !currentMap[prev.ticker])
+    .map(prev => ({
+      ticker: prev.ticker,
+      assetName: prev.assetName,
+      previousPrice: Number(prev.currentPrice || 0),
+      previousQuantity: Number(prev.quantity || 0)
+    }));
+
+  const sortedByAbsMove = holdingChanges
+    .slice()
+    .sort((a, b) => Math.abs(b.priceChangePct || 0) - Math.abs(a.priceChangePct || 0));
+
+  const finalAllocations = holdingChanges
+    .slice()
+    .sort((a, b) => b.allocationPct - a.allocationPct)
+    .map(h => ({
+      ticker: h.ticker,
+      assetName: h.assetName,
+      currentValue: h.currentValue,
+      allocationPct: h.allocationPct
+    }));
+
+  return {
+    hasPreviousSnapshot: !!previousSnapshot,
+    previousSavedAt: previousSnapshot ? previousSnapshot.savedAt : null,
+    upHoldings: holdingChanges.filter(h => h.priceChange > 0).length,
+    downHoldings: holdingChanges.filter(h => h.priceChange < 0).length,
+    flatHoldings: holdingChanges.filter(h => h.priceChange === 0).length,
+    biggestPriceMoves: sortedByAbsMove.slice(0, 8),
+    finalAllocations,
+    holdingChanges,
+    removedHoldings,
+    totalCurrentValue
+  };
+}
+
+function getGroupedTavilyResearch() {
+  return TAVILY_GROUPS.map(group => runTavilyGroupSearch(group.groupName, group.query));
+}
+
+function runTavilyGroupSearch(groupName, query) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('TAVILY_API_KEY');
+  if (!apiKey) {
+    throw new Error('Missing TAVILY_API_KEY in Script Properties.');
+  }
+
+  const payload = {
+    api_key: apiKey,
+    query: query,
+    topic: 'news',
+    search_depth: PORTFOLIO_CONFIG.TAVILY_SEARCH_DEPTH,
+    max_results: PORTFOLIO_CONFIG.TAVILY_MAX_RESULTS,
+    include_answer: true,
+    include_raw_content: false,
+    time_range: 'w'
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  try {
+    const response = UrlFetchApp.fetch('https://api.tavily.com/search', options);
+    const code = response.getResponseCode();
+    const text = response.getContentText();
+
+    if (code !== 200) {
+      return {
+        groupName,
+        query,
+        answer: '',
+        results: [],
+        error: text
+      };
+    }
+
+    const json = JSON.parse(text);
+
+    return {
+      groupName,
+      query,
+      answer: json.answer || '',
+      results: (json.results || []).map(item => ({
+        title: item.title || '',
+        url: item.url || '',
+        content: item.content || '',
+        score: item.score || null
+      }))
+    };
+  } catch (e) {
+    return {
+      groupName,
+      query,
+      answer: '',
+      results: [],
+      error: String(e)
+    };
+  }
+}
+
+function buildGeminiPortfolioPrompt(currentHoldings, previousSnapshot, changeSummary, groupedResearch) {
+  return `
+You are a professional asset manager writing a weekly portfolio update email.
+
+Return ONLY plain, clean HTML suitable for Gmail.
+Do not use markdown.
+Do not use CSS.
+Use only simple tags like h2, h3, p, ul, li, table, tr, td, th, strong, em.
+
+The user wants the report to answer:
+1. What moved in price this week
+2. What are the final allocations after those moves
+3. What should I pay attention to next
+
+Instructions:
+- Focus primarily on weekly price changes by holding.
+- Then show the current final allocation snapshot based on current values.
+- Use the grouped research to explain possible drivers and future watchpoints.
+- Do not discuss premium/discount to NAV.
+- Do not frame the report around concentration analysis.
+- Mention quantity changes only if relevant.
+- If no previous snapshot exists, clearly state this is the first tracked update.
+- Keep the report concise, professional, and practical.
+
+Please structure the email as:
+1. What Moved in Price This Week
+2. Final Allocations
+3. What the News Means
+4. What to Pay Attention to Next
+
+For the Final Allocations section:
+- show only the top 5 allocations by current value
+
+For the What Moved in Price This Week section:
+- discuss only the 3 to 5 most important price movers
+
+For the What the News Means section:
+- discuss only the 3 to 5 most relevant news developments this past week
+- explain briefly why they matter for the holdings or portfolio
+
+Previous snapshot:
+${JSON.stringify(previousSnapshot, null, 2)}
+
+Current holdings:
+${JSON.stringify(currentHoldings, null, 2)}
+
+Weekly change summary:
+${JSON.stringify(changeSummary, null, 2)}
+
+Grouped Tavily research:
+${JSON.stringify(groupedResearch, null, 2)}
+`;
+}
+
+function callGeminiForHtmlReport(prompt) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!apiKey) {
+    throw new Error('Missing GEMINI_API_KEY in Script Properties.');
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${PORTFOLIO_CONFIG.GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: 0.35,
+      maxOutputTokens: 1200
+    }
+  };
+
+  return fetchGeminiWithRetry_(url, payload, 3);
+}
+
+function fetchGeminiWithRetry_(url, payload, maxAttempts) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt) {
+    try {
+      const options = {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      };
+
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      const text = response.getContentText();
+
+      if (code === 200) {
+        const json = JSON.parse(text);
+        const output = json?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!output) {
+          throw new Error('Gemini returned no usable content.');
+        }
+        return output;
+      }
+
+      if (code === 429 || code >= 500) {
+        lastError = new Error(`Gemini temporary error (${code}): ${text}`);
+        Utilities.sleep(attempt * 2000);
+        continue;
+      }
+
+      throw new Error(`Gemini API error (${code}): ${text}`);
+    } catch (e) {
+      lastError = e;
+      if (attempt < maxAttempts) {
+        Utilities.sleep(attempt * 2000);
+      }
+    }
+  }
+
+  throw lastError || new Error('Gemini request failed after retries.');
+}
+
+function buildFallbackHtmlReport(changeSummary, groupedResearch, errorObj) {
+  const priceRows = (changeSummary.biggestPriceMoves || []).map(h => `
+    <tr>
+      <td>${escapeHtml_(h.ticker)}</td>
+      <td>${escapeHtml_(h.assetName)}</td>
+      <td>${formatNumber_(h.previousPrice)}</td>
+      <td>${formatNumber_(h.currentPrice)}</td>
+      <td>${formatSignedNumber_(h.priceChange)}</td>
+      <td>${formatSignedPercent_(h.priceChangePct)}</td>
+    </tr>
+  `).join('');
+
+  const allocationRows = (changeSummary.finalAllocations || []).map(h => `
+    <tr>
+      <td>${escapeHtml_(h.ticker)}</td>
+      <td>${escapeHtml_(h.assetName)}</td>
+      <td>${formatNumber_(h.currentValue)}</td>
+      <td>${formatPercent_(h.allocationPct)}</td>
+    </tr>
+  `).join('');
+
+  const researchHtml = groupedResearch.map(group => {
+    const items = (group.results || []).slice(0, 3).map(r => `
+      <li><strong>${escapeHtml_(r.title)}</strong><br>${escapeHtml_(r.content)}</li>
+    `).join('');
+
+    return `
+      <h3>${escapeHtml_(group.groupName)}</h3>
+      <p>${escapeHtml_(group.answer || 'No summary available.')}</p>
+      <ul>${items || '<li>No relevant items returned.</li>'}</ul>
+    `;
+  }).join('');
+
+  return `
+    <h2>Weekly Portfolio Update</h2>
+    <p><strong>Note:</strong> Gemini generation failed, so this fallback summary was sent.</p>
+    <p><strong>Error:</strong> ${escapeHtml_(String(errorObj))}</p>
+
+    <h3>What Moved in Price This Week</h3>
+    <p><strong>Previous Snapshot:</strong> ${escapeHtml_(changeSummary.previousSavedAt || 'None')}</p>
+    <p><strong>Holdings Up:</strong> ${changeSummary.upHoldings}</p>
+    <p><strong>Holdings Down:</strong> ${changeSummary.downHoldings}</p>
+    <p><strong>Holdings Flat:</strong> ${changeSummary.flatHoldings}</p>
+
+    <table border="1" cellpadding="6" cellspacing="0">
+      <tr>
+        <th>Ticker</th>
+        <th>Asset</th>
+        <th>Prev Price</th>
+        <th>Current Price</th>
+        <th>Change</th>
+        <th>Change %</th>
+      </tr>
+      ${priceRows}
+    </table>
+
+    <h3>Final Allocations</h3>
+    <table border="1" cellpadding="6" cellspacing="0">
+      <tr>
+        <th>Ticker</th>
+        <th>Asset</th>
+        <th>Current Value</th>
+        <th>Allocation %</th>
+      </tr>
+      ${allocationRows}
+    </table>
+
+    <h3>What to Pay Attention to Next</h3>
+    ${researchHtml}
+
+    <h3>Disclaimer</h3>
+    <p>This automated summary is for informational purposes only and is not financial advice.</p>
+  `;
+}
+
+function toNumber(value) {
+  if (value === null || value === '' || value === undefined) return 0;
+  if (typeof value === 'number') return value;
+  const cleaned = String(value).replace(/[^0-9.-]/g, '');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+}
+
+function formatNumber_(value) {
+  return Number(value || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function formatPercent_(value) {
+  return `${Number(value || 0).toFixed(2)}%`;
+}
+
+function formatSignedNumber_(value) {
+  const num = Number(value || 0);
+  const formatted = Math.abs(num).toLocaleString(undefined, { maximumFractionDigits: 2 });
+  return num > 0 ? `+${formatted}` : num < 0 ? `-${formatted}` : '0';
+}
+
+function formatSignedPercent_(value) {
+  if (value === null || value === undefined || isNaN(value)) return 'N/A';
+  const num = Number(value || 0);
+  return num > 0 ? `+${num.toFixed(2)}%` : num < 0 ? `${num.toFixed(2)}%` : '0.00%';
+}
+
+function escapeHtml_(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function testTavily() {
+  const result = runTavilyGroupSearch(
+    'Test',
+    '"Asset A" latest news past week Singapore'
+  );
+  Logger.log(JSON.stringify(result, null, 2));
+}
